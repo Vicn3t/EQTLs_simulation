@@ -1,0 +1,348 @@
+---
+title: "GWAS"
+author: "Vincent_Spinelli"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## GWAS
+
+In this part, we will proceed with some GWAS analyses, notably:
+
+-   Linear Models
+
+-   Mixed Model (Yu et al., 2006)
+
+## Preparation
+```{r libraries}
+
+# Load required libraries
+library(here)
+library(dplyr)
+library(rrBLUP)
+
+options(scipen=3)
+```
+
+```{r data, echo=FALSE}
+
+# Clean environment
+rm(list = ls())
+
+# Load expression and genotype data
+c_18_gene_expression <- readRDS(here("data/03_cleaned_r_data", "c_18_gene_expression.RDS"))
+sample_genotype <- readRDS(here("data/03_cleaned_r_data", "sample_genotype.RDS"))
+ind_metadata <- readRDS(here("data/03_cleaned_r_data", "ind_metadata.RDS"))
+
+# Target genes for analysis
+selected_gene <- "ENSSSCG00000016653"
+sample_c_18_gene_expression <- c_18_gene_expression[c(
+  "ENSSSCG00000016472", "ENSSSCG00000016487", "ENSSSCG00000016626", "ENSSSCG00000016653"), ]
+```
+
+```{r create_Models_Folder}
+
+# Create model output directory (clean slate)
+output_dir <- here("data/04_Stats_models")
+if (!dir.exists(output_dir)) dir.create(output_dir)
+unlink(file.path(output_dir, "*"), recursive = TRUE)
+
+```
+
+## Models fitting
+
+```{r}
+
+# Get expression vector for selected gene (1 value per individual)
+gene_expr <- sample_c_18_gene_expression[selected_gene, , drop = TRUE]
+
+# Transpose genotype to [individuals x variants]
+sample_genotype_t <- t(sample_genotype)
+
+# Apply linear model to each variant
+perform_test <- function(variant, gene) {
+  model <- lm(gene ~ variant)
+  pval <- summary(model)$coefficients[2, 4]
+  return(pval)
+}
+
+# Compute p-values for all variants
+simple_lm_pvals <- apply(sample_genotype_t, 2, perform_test, gene = gene_expr)
+
+# Format results
+simple_lm_pvals <- data.frame(p_value = simple_lm_pvals, row.names = colnames(sample_genotype_t))
+
+# Save
+saveRDS(simple_lm_pvals, here("data/04_Stats_models", "results_linear_model.RDS"))
+
+```
+
+#### Fixed breed effect
+# Everything below is old and should not work anymore
+
+```{r LM_fixed_breed_effect}
+start_time <- proc.time()[3]
+
+# Define the function to perform linear regression for each variant and breed
+perform_test_fixed_breed <- function(variant, gene, breed) {
+  lm_result <- lm(gene ~ variant + breed)
+  pval <- summary(lm_result)$coefficients[2, 4]
+  return(pval)
+}
+# Calculate p-values for each gene with fixed breed
+fixed_breed_pvals <- sapply(sample_c_18_gene_expression[, selected_gene, drop = FALSE], 
+                                function(gene) {
+  sapply(sample_genotype, perform_test_fixed_breed, gene = gene, breed = ind_metadata$breed)
+})
+
+fixed_breed_pvals <- data.frame(fixed_breed_pvals, row.names = colnames(sample_genotype))
+
+
+elapsed_time <- proc.time()[3] - start_time
+cat(
+  "Elapsed Time: ",
+  floor(elapsed_time / 60),
+  " minutes and ",
+  elapsed_time %% 60,
+  " seconds\n")
+
+saveRDS(fixed_breed_pvals, file = here("data/04_Stats_models","results_linear_model_fixed_breed_effect.RDS"))
+```
+
+#### Separately per breed
+
+```{r LM_separately_per_breed}
+ start_time <- proc.time()[3]
+
+# Define the function to perform linear regression for each variant
+perform_test_separate_race <- function(variant, gene) {
+  lm_result <- lm(gene ~ variant)
+  if (nrow(summary(lm_result)$coefficients) == 1){
+    pval <- 1
+  } else{
+    pval <- summary(lm_result)$coefficients[2, 4]
+  }
+  return(pval)
+}
+
+# Initialize matrix to store p-values per race
+per_race_pvals <- matrix(
+  0, 
+  ncol = 3,
+  nrow = ncol(sample_genotype)
+)
+
+# Loop over each breed
+for (i in 1:3){
+  breed <- c("Duroc", "LargeWhite", "Landrace")[i]
+  # Extract vectors of one_breed_ids, separated by breed
+  one_breed_ids <- as.vector(ind_metadata[ind_metadata$breed == breed, ]$id)
+  
+  # Make a RNA-seq table where one_breed_ids are all from a specific breed
+  one_breed_boolean_ids <- rownames(sample_c_18_gene_expression) %in% one_breed_ids
+  one_breed_RNAseq <- sample_c_18_gene_expression[one_breed_boolean_ids, ]
+  one_breed_genotype <- sample_genotype[one_breed_boolean_ids, ]
+  
+  # Perform linear regression for each gene
+  separate_races_pvals <- sapply(one_breed_RNAseq[, selected_gene, drop = FALSE], function(gene) {"data/04_Stats_models"
+    sapply(one_breed_genotype, 
+           perform_test_separate_race, 
+           gene = gene)
+  })
+  colnames(separate_races_pvals) <- breed
+  per_race_pvals[, i] <- separate_races_pvals
+}
+per_race_pvals <- as.data.frame(
+  per_race_pvals,
+  row.names = colnames(sample_genotype)
+)
+colnames(per_race_pvals) <- c("Duroc", "LargeWhite","Landrace")
+
+rm(one_breed_genotype,one_breed_RNAseq,one_breed_boolean_ids,one_breed_ids,breed)
+
+elapsed_time <- proc.time()[3] - start_time
+cat(
+  "Elapsed Time: ",
+  floor(elapsed_time / 60),
+  " minutes and ",
+  elapsed_time %% 60,
+  " seconds\n")
+
+saveRDS(per_race_pvals, file = here("data/04_Stats_models","results_linear_model_separate_breed.RDS"))
+```
+
+### Mixed Model
+
+#### No effects
+
+```{r rrBLUP_no_effects}
+start_time <- proc.time()[3]
+
+# Compute kinship matrix
+centered <- as.matrix(sample_genotype) - 1
+GRM <- A.mat(centered)
+
+# Extracting expression data for the gene gene
+gene_expression <- data.frame(
+  id = rownames(sample_genotype), 
+  sample_c_18_gene_expression[, selected_gene])
+
+# Create a data frame for genetic data
+genotype_GWAS_table <- data.frame(
+  id = colnames(sample_genotype),  
+  chr = 18,  # Chromosome information
+  
+    # Position information
+  pos = unlist(lapply(strsplit(colnames(sample_genotype), split = "_", fixed = TRUE), function(x) x[2])),  
+  
+  # Transpose of the centered matrix
+  t(centered)
+  )
+
+colnames(genotype_GWAS_table)[-c(1:3)] <- rownames(sample_genotype)
+
+#start <- proc.time()[3]
+# Perform GWAS using kinship matrix
+GWAS_results <- GWAS(pheno = gene_expression, geno = genotype_GWAS_table, K = GRM, plot = FALSE)
+
+#Calculate elapsed time
+elapsed_time <- proc.time()[3] - start_time
+cat(
+  "Elapsed Time: ",
+  floor(elapsed_time / 60),
+  " minutes and ",
+  elapsed_time %% 60,
+  " seconds\n"
+)
+
+# Correct p-values
+results <- data.frame(GWAS_results[, ncol(GWAS_results)])
+rownames(results) <- GWAS_results$id
+colnames(results) <- "p-values"
+
+ordered_results <- results[order(as.numeric(rownames(results))), , drop = FALSE]
+
+ordered_pvals <- results[order(results$"p-values"), ,drop = FALSE]
+
+corrected_results <- data.frame(
+  10^(-ordered_results$"p-values"), 
+  row.names = rownames(ordered_results)
+)
+
+GWAS_kinship_pvals <- corrected_results
+
+saveRDS(GWAS_kinship_pvals, file = here("data/04_Stats_models","results_rrBLUP_kinship.RDS"))
+```
+
+#### Fixed breed effect
+
+```{r rrBLUP_fixed_effects}
+start_time <- proc.time()[3]
+
+# Compute kinship matrix
+centered <- as.matrix(sample_genotype) - 1
+GRM <- A.mat(centered)
+
+# Extracting expression data for the gene gene
+gene_expression <- data.frame(
+  id = rownames(sample_genotype),
+  breed = ind_metadata$breed, 
+  sample_c_18_gene_expression[, selected_gene])
+
+# Create a data frame for genetic data
+genotype_GWAS_table <- data.frame(
+  id = colnames(sample_genotype),
+  chr = 18,  # Chromosome information
+  
+    # Position information
+  pos = unlist(lapply(strsplit(colnames(sample_genotype), split = "_", fixed = TRUE), function(x) x[2])),  
+  
+  # Transpose of the centered matrix
+  t(centered)
+  )
+
+colnames(genotype_GWAS_table)[-c(1:3)] <- rownames(sample_genotype)
+
+#start <- proc.time()[3]
+
+# Perform GWAS with fixed effect
+GWAS_results <- GWAS(pheno = gene_expression, geno = genotype_GWAS_table, K = GRM, fixed = "breed", plot = FALSE)
+
+
+#Calculate elapsed time
+elapsed_time <- proc.time()[3] - start_time
+cat(
+  "Elapsed Time: ",
+  floor(elapsed_time / 60),
+  " minutes and ",
+  elapsed_time %% 60,
+  " seconds\n"
+)
+
+# Correct p-values
+results <- data.frame(GWAS_results[, ncol(GWAS_results)])
+rownames(results) <- GWAS_results$id
+colnames(results) <- "p-values"
+
+ordered_results <- results[order(as.numeric(rownames(results))), , drop = FALSE]
+
+ordered_pvals <- results[order(results$"p-values"), ,drop = FALSE]
+
+corrected_results <- data.frame(
+  10^(-ordered_results$"p-values"), 
+  row.names = rownames(ordered_results)
+)
+
+GWAS_breed_effect_pvals <- corrected_results
+
+saveRDS(GWAS_breed_effect_pvals, file = here("data/04_Stats_models","results_rrBLUP_fixed_breed_effect.RDS"))
+```
+
+```{r rrBLUP_separate_breed}
+
+
+
+p_vals_per_breed_k <- list()
+for (breed in c("Duroc", "LargeWhite", "Landrace")){
+    print(breed)
+    start <- proc.time()[3] 
+    # 1. Select indivduals from the breed
+    indx <- which(rownames(sample_c_18_gene_expression) %in% as.vector(ind_metadata[ind_metadata$breed == breed,]$id))
+    # 2. Select the genotype of the individuals from the breed
+    individuals_genotype <- sample_genotype[indx,]
+    # 3. Select RNA-seq data of the individuals from the breed
+    gene_expression <- data.frame(
+        id = rownames(individuals_genotype),
+        gene = sample_c_18_gene_expression[indx, selected_gene]
+    )
+    # 4. Compute kinship matrix
+    centered_separate <- as.matrix(individuals_genotype) - 1
+    GRM <- A.mat(centered_separate)
+    # 5. Format data to prepare for GWAS
+    geno_full <- data.frame(
+        id = colnames(centered_separate),
+        chr = 18,
+        pos = unlist(lapply(strsplit(colnames(centered_separate), split = "_", fixed = TRUE), function(x) x[2])),
+        t(centered_separate)
+    )
+    # 6. GWAS
+    result <- GWAS(pheno=gene_expression, geno=geno_full, K=GRM, plot=FALSE) # Warning, the -log_10(pval) is in the column gene
+    # 7. Store p-values for the current breed
+    p_vals_per_breed_k[[breed]] <- result[, ncol(result)]
+    # 8. Show elapsed time
+    elapsed_time <- proc.time()[3] - start
+    cat("Elapsed Time: ", 
+      floor(elapsed_time / 60), " minutes and ",
+    elapsed_time %% 60, " seconds\n"
+  )
+}
+p_vals_per_breed_k_final <- data.frame(
+  Duroc = 10^(-p_vals_per_breed_k$Duroc),
+  LargeWhite = 10^(-p_vals_per_breed_k$LargeWhite),
+  Landrace = 10^(-p_vals_per_breed_k$Landrace)
+)
+
+
+rownames(p_vals_per_breed_k_final) <- rownames(result)
+saveRDS(p_vals_per_breed_k_final, file = here("data/04_Stats_models","results_rrBLUP_separate_breed.RDS"))
+```

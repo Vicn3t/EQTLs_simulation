@@ -1,0 +1,225 @@
+---
+title: "GWAS model testing"
+author: "Vincent_Spinelli"
+date: "`r Sys.Date()`"
+output: html_document
+---
+```{r library, message = FALSE, warning = FALSE}
+library(here)       # For constructing file paths relative to the project root
+library(tidyverse)      # For data manipulation
+library(stringr)
+options(scipen=3)
+```
+
+
+```{r import data}
+
+rm(list = ls())
+
+# Define breeds of interest
+breed_vector <- readRDS(here("data/04_simulation_r_data", "breed_vector.RDS"))
+
+gene_qtl_association_beta_table <-readRDS(file = here("data/04_simulation_r_data","gene_qtl_association_beta_table.RDS"))
+
+global_gene_expression_df <-readRDS(file = here("data/04_simulation_r_data","global_gene_expression_df.RDS"))
+
+breeds_gene_expression_df <-readRDS(file = here("data/04_simulation_r_data","global_gene_expression_df.RDS"))
+
+global_genotype_matrix <- readRDS(file = here("data/04_simulation_r_data","sample_genotype.RDS"))
+
+ind_metadata <- readRDS(file = here("data/03_cleaned_r_data","ind_metadata.RDS"))
+
+variant_maf_table <- readRDS(here("data/04_simulation_r_data", "variant_maf_table.RDS"))
+
+gene_name <- "ENSSSCG00000046530"
+
+# Create directory for storing rrBLUP models results if it doesn't exist
+if (!dir.exists(here("data", "05_simulation_models_results/rrBLUP"))) {
+  dir.create(here("data", "05_simulation_models_results/rrBLUP"), recursive = TRUE)
+}
+
+# Import modified rrBLUP functions to fetch betas
+# Use rrBLUP For genomic prediction using BLUP models
+fichiers <- list.files(here("functions"), pattern = "\\.R$", full.names=TRUE)
+for (fichier in fichiers){
+  source(fichier)
+  }
+```
+
+
+
+```{r model rrBLUP}
+    
+
+perform_rrBLUP_GWAS <- function(model_name, gene_name, params, genotype_matrix,
+                                gene_expression_df, gene_qtl_association_beta_table, snp_df, ind_metadata) {
+  
+  # Extract gene expression for the given model and index
+  gene_expression_df <- gene_expression_df[,gene_name, drop = FALSE]
+  
+  # put the individuals ids as column for rrBLUP 
+  gene_expression_df <- cbind(rownames(gene_expression_df), gene_expression_df)
+  colnames(gene_expression_df)[1] <- "id"  
+  
+  # Extract QTL names and data
+  qtl_df <- gene_qtl_association_beta_table[gene_qtl_association_beta_table$associated_gene == gene_name,]
+  
+  print(paste0("Running ", model_name, "_GWAS on ",gene_name, " gene"))
+  
+  # Compute the kinship matrix
+  genetic_relationship_matrix <- A.mat(t(genotype_matrix))
+  
+  # Prepare genotype table for GWAS
+  genotype_GWAS_table <- data.frame(
+    id = snp_df$variant_order,
+    chr = 18,
+    pos = snp_df$variant_position,
+    genotype_matrix-1
+  )
+  
+  
+  # Add breed information if model includes fixed effects
+  if (grepl("fixed", params)) {
+    gene_expression_df$breed_id <- filtered_breed <- ind_metadata$breed[ind_metadata$breed != "Duroc"]
+  }
+
+  # Parse and evaluate model parameters
+  params_list <- eval(parse(text = params))
+  
+  dim(genotype_GWAS_table)
+  dim(gene_expression_df)
+  dim(genetic_relationship_matrix)
+
+  # Run GWAS using rrBLUP
+  GWAS_results <- do.call(GWAS, params_list)
+  
+  # Format results
+  significant_snps <- GWAS_results %>% 
+    mutate(pvalue = 10^(-scores)) %>%
+    mutate(beta = betas) %>%
+    filter(pvalue < 0.05) %>%
+    rownames_to_column(var = "snp_id") %>%
+    select(snp_id,beta,pvalue)
+
+      
+  saveRDS(significant_snps,here("data/05_simulation_models_results/rrBLUP", paste0(model_name,"_rrBLUP_eGWAS.RDS")))
+  
+  return(significant_snps)
+}
+
+
+```
+
+```{r global models}
+# --- Inter-breed model ---
+
+params <- 'list(pheno = gene_expression_df, geno = genotype_GWAS_table, K = genetic_relationship_matrix, min.MAF = 0.00, plot = FALSE)'
+
+rrblup_global_qtls <- perform_rrBLUP_GWAS(
+  model_name = "inter_breed",
+  gene_name= gene_name,
+  params = params,
+  genotype_matrix = global_genotype_matrix,
+  gene_expression_df = global_gene_expression_df,
+  gene_qtl_association_beta_table = gene_qtl_association_beta_table,
+  snp_df = variant_maf_table,
+  ind_metadata = 0
+)
+
+
+# --- Inter-breed model with fixed breed effect ---
+fixed_params <- 'list(pheno = gene_expression_df, geno = genotype_GWAS_table, K = genetic_relationship_matrix, min.MAF = 0.00, fixed = "breed_id", plot = FALSE)'
+
+rrblup_fixed_global_qtls <- perform_rrBLUP_GWAS(
+  model_name = "fixed_effect_inter_breed",
+  gene_name= gene_name,
+  params = fixed_params,
+  genotype_matrix = global_genotype_matrix,
+  gene_expression_df = global_gene_expression_df,
+  gene_qtl_association_beta_table = gene_qtl_association_beta_table,
+  snp_df = variant_maf_table,
+  ind_metadata = ind_metadata
+)
+```
+
+```{r breeds models}
+
+
+# --- Intra-breed models with breeds betas ---
+params<- 'list(pheno = gene_expression_df, geno = genotype_GWAS_table, K = genetic_relationship_matrix, min.MAF = 0.00, plot = FALSE)'
+  
+# Run GWAS for each breed separately
+rrBLUP_breeds_breed_effect_qtl <- lapply(breed_vector, function(breed) {
+  
+  breed_gene_expression <- breeds_gene_expression_df[str_starts(colnames(global_genotype_matrix), breed),, drop = FALSE]
+
+  breed_genotype_matrix <- global_genotype_matrix[,str_starts(colnames(global_genotype_matrix), breed) , drop = FALSE]
+
+  breed_model_name <- paste0(breed, "_breeds_simulated_expression")
+  
+  # Compute the variance per SNP
+  snp_variances <- apply(breed_genotype_matrix, 1, var, na.rm = TRUE)
+
+  valid_snps <- names(snp_variances[snp_variances > 0])
+
+  # Subset genotype matrix to SNPs with variance > 0
+  breed_genotype_matrix <- breed_genotype_matrix[valid_snps, , drop = FALSE]
+  breed_variant_maf_table <- variant_maf_table
+  rownames(breed_variant_maf_table) = breed_variant_maf_table$variant_id
+  breed_variant_maf_table <- breed_variant_maf_table[valid_snps, , drop = FALSE]
+  
+  rrblup_breed_qtls <- perform_rrBLUP_GWAS(
+    model_name = breed_model_name,
+    gene_name= gene_name,
+    params = params,
+    genotype_matrix = breed_genotype_matrix,
+    gene_expression_df = breed_gene_expression,
+    gene_qtl_association_beta_table = gene_qtl_association_beta_table,
+    snp_df = breed_variant_maf_table,
+    ind_metadata = 0
+  )
+
+  return(rrblup_breed_qtls)
+})
+
+# --- Intra-breed models with global betas ---
+params<- 'list(pheno = gene_expression_df, geno = genotype_GWAS_table, K = genetic_relationship_matrix, min.MAF = 0.00, plot = FALSE)'
+  
+# Run GWAS for each breed separately
+rrBLUP_breeds_global_effect_qtl <- lapply(breed_vector, function(breed) {
+  
+  breed_gene_expression <- global_gene_expression_df[str_starts(colnames(global_genotype_matrix), breed),, drop = FALSE]
+
+  breed_genotype_matrix <- global_genotype_matrix[,str_starts(colnames(global_genotype_matrix), breed) , drop = FALSE]
+
+  breed_model_name <- paste0(breed, "_global_simulated_expression")
+  
+  # Compute the variance per SNP
+  snp_variances <- apply(breed_genotype_matrix, 1, var, na.rm = TRUE)
+
+  # Keep only SNPs with variance > 0
+  valid_snps <- names(snp_variances[snp_variances > 0])
+
+  # Subset genotype matrix to SNPs with variance > 0
+  breed_genotype_matrix <- breed_genotype_matrix[valid_snps, , drop = FALSE]
+  breed_variant_maf_table <- variant_maf_table
+  rownames(breed_variant_maf_table) = breed_variant_maf_table$variant_id
+  breed_variant_maf_table <- breed_variant_maf_table[valid_snps, , drop = FALSE]
+  
+  rrblup_breed_qtls <- perform_rrBLUP_GWAS(
+    model_name = breed_model_name,
+    gene_name= gene_name,
+    params = params,
+    genotype_matrix = breed_genotype_matrix,
+    gene_expression_df = breed_gene_expression,
+    gene_qtl_association_beta_table = gene_qtl_association_beta_table,
+    snp_df = breed_variant_maf_table,
+    ind_metadata = 0
+  )
+
+  return(rrblup_breed_qtls)
+})
+
+```
+
+

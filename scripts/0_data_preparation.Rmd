@@ -1,0 +1,276 @@
+---
+title: "Data_prep_Vincent"
+author: "Vincent_Spinelli"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r library loading, include=FALSE, warning=FALSE}
+# Path management 
+library(here)
+
+# Table manipulation
+library(tidyverse)
+
+
+# Genomic Data processing:
+library(vcfR)
+library(AnnotationHub) # Querying genomic annotations
+library(ensembldb)
+```
+
+# Fetching raw data
+
+```{r data_importation}
+
+# Clear workspace
+rm(list = ls())
+
+# Create output directory for cleaned R data if it doesn't exist
+
+if (!dir.exists(here("data", "03_cleaned_r_data"))) {
+  dir.create(here("data", "03_cleaned_r_data"), recursive = TRUE)
+}
+
+# Load RNA-seq gene expression data (duodenum tissue, LogCPM normalized)
+# Rows = genes, columns = individuals (need transpose for GWAS)
+full_gene_expression <- read.table(
+  file = here("data/01_wgs", "LogCPM_counts_GENE-SWitCH_duodenum.txt"),
+  header = TRUE,
+  row.names = 1
+)
+
+full_gene_expression <- t(full_gene_expression)  # Individuals as rows
+
+# Load individual metadata (breed, sex, etc.)
+raw_ind_metadata <- read.table(
+  file = here("data/01_wgs", "WGS_300_GENE-SWitCH.filter_maf0.05_geno0.1.fam"),
+  sep = " "
+)
+
+# # ---- VCF Handling Section (Uncomment for first execution only) ----
+# #This section loads SNP genotypes from a PLINK VCF export and saves as RDS
+# # The following PLINK command was used to produce the VCF to put in "data/01_wgs":
+# # plink2 --bfile WGS_300_GENE-SWitCH.filter_maf0.05_geno0.1 --chr 18 --recode vcf --out wgs_pig_chr18
+# 
+# library(vcfR)
+# vcf <- read.vcfR(here("data/01_wgs", "wgs_pig_chr18.vcf"))
+# raw_full_binary_genotype <- t(extract.gt(vcf))  # Transpose to have individuals as rows
+# rm(vcf)
+# saveRDS(raw_full_binary_genotype, here("data/03_cleaned_r_data","raw_full_binary_genotype.RDS"))
+
+# Load pre-saved binary SNP genotype data (character format: "0/0", "0/1", "1/1")
+binary_genotype <- readRDS(file = here("data/03_cleaned_r_data", "raw_full_binary_genotype.RDS"))
+
+```
+
+# Preprocessing data
+
+## Checking the order of the individuals
+
+```{r check_individuals_order}
+
+# Extract standardized individual IDs
+gene_ids <- sub("_D$", "", colnames(full_gene_expression))
+geno_ids <- sub("^[^_]+_", "", rownames(binary_genotype))
+meta_ids <- raw_ind_metadata$V2
+
+# Check consistency of IDs across datasets
+if (identical(meta_ids, gene_ids) && identical(meta_ids, geno_ids)) {
+  message("Correct name format detected")
+  
+  # pad ids with 0 for easier sorting
+  padded_ids <- str_replace(meta_ids, "(\\D+)_(\\d+)", function(x) {
+    prefix <- str_match(x, "(\\D+)_")[,2]
+    number <- str_match(x, "_(\\d+)")[,2]
+    number_padded <- str_pad(number, 3, pad = "0")
+    paste0(prefix, "_", number_padded)
+    })
+  
+  # Apply padded IDs to row/column names
+  rownames(raw_ind_metadata) <- padded_ids
+  rownames(binary_genotype) <- padded_ids
+  colnames(full_gene_expression) <- padded_ids
+  
+  # Sort all datasets by padded IDs
+  sort_index <- order(padded_ids)
+  sorted_ids <- padded_ids[sort_index]
+  
+  raw_ind_metadata <- raw_ind_metadata[sorted_ids, ]
+  binary_genotype <- binary_genotype[sorted_ids, ]
+  full_gene_expression <- full_gene_expression[, sorted_ids]
+  
+  # Final consistency check
+  stopifnot(
+    identical(rownames(raw_ind_metadata), rownames(binary_genotype)),
+    identical(rownames(raw_ind_metadata), colnames(full_gene_expression))
+  )
+  
+} else {
+  message("Incorrect name format")
+}
+
+rm(gene_ids,
+   geno_ids,
+   meta_ids,
+   padded_ids,
+   sort_index,
+   sorted_ids)
+```
+
+## Changing datasets data class
+
+```{r genotype_data_prep}
+
+# Extract variant IDs and positions from genotype matrix column names
+variant_ids <- colnames(binary_genotype)
+
+# Extract numerical order suffix (e.g., from "SNP_123" -> "123")
+variant_order <- str_extract(variant_ids, "(?<=_)\\d+$")
+
+# Check if variant order is strictly sequential
+if (all(as.character(seq_along(variant_order)) == variant_order)) {
+  message("The variants are correctly ordered")
+} else {
+  message("The variants are not correctly ordered")
+}
+
+# Extract variant position (between underscores, e.g., "SNP_453_23456" -> "23456")
+variant_position <- str_extract(variant_ids, "(?<=_)\\d+(?=_)")
+
+# Create and save variant metadata
+variant_metadata <- data.frame(
+  variant_id = variant_ids,
+  variant_order = variant_order,
+  variant_position = as.numeric(variant_position),
+  stringsAsFactors = FALSE
+)
+
+saveRDS(variant_metadata, here("data/03_cleaned_r_data", "variant_metadata.RDS"))
+
+# Initialize numeric genotype matrix
+numeric_genotype <- matrix(
+  0,
+  nrow = nrow(binary_genotype),
+  ncol = ncol(binary_genotype),
+  dimnames = list(rownames(binary_genotype), variant_ids)
+)
+
+# Convert genotype strings to numeric values: 0 (homo ref), 1 (hetero), 2 (homo alt)
+numeric_genotype[binary_genotype == "0/0"] <- 0
+numeric_genotype[binary_genotype %in% c("0/1", "1/0")] <- 1
+numeric_genotype[binary_genotype == "1/1"] <- 2
+
+# Remove variants with zero variance across individuals (uninformative)
+non_null_var <- apply(numeric_genotype, 2, var) != 0
+numeric_genotype <- numeric_genotype[, non_null_var]
+
+# Transpose to match GWAS convention: rows = variants, cols = individuals
+numeric_genotype <- t(numeric_genotype)
+
+# Save full genotype matrix
+saveRDS(numeric_genotype, here("data/03_cleaned_r_data", "full_genotype.RDS"))
+
+# Create a smaller genotype subset (for simulation)
+set.seed(123)
+subset_index <- sort(sample(seq_len(nrow(numeric_genotype)), 10000))
+sample_genotype <- numeric_genotype[subset_index, ]
+
+# Save subset
+saveRDS(sample_genotype, here("data/03_cleaned_r_data", "sample_genotype.RDS"))
+
+rm(
+  binary_genotype,
+  variant_ids,
+  variant_order,
+  variant_position,
+  variant_metadata,
+  numeric_genotype,
+  non_null_var,
+  subset_index,
+  sample_genotype)
+```
+
+## Metadata preparation
+We prepare metadata for future use.
+
+```{r metadata_preparation}
+
+# Recode sex column (V5) for clarity (0 -> "N/A", 1 -> "Male", 2 -> "Female")
+# Construct a clean metadata frame with explicit column names and factors
+ind_metadata <- raw_ind_metadata %>%
+  mutate(
+    sex = case_when(
+      V5 == 0 ~ "N/A",
+      V5 == 1 ~ "Male",
+      V5 == 2 ~ "Female",
+      TRUE ~ as.character(V5)),
+    breed = factor(V1),
+    id = rownames(raw_ind_metadata)) %>%
+  dplyr::select(id, breed, sex) %>%
+  mutate(
+    sex = factor(sex),
+    prefix = case_when(
+      breed == "Duroc" ~ "DU",
+      breed == "Landrace" ~ "LD",
+      breed == "LargeWhite" ~ "LW",
+      TRUE ~ NA_character_),
+    prefix = factor(prefix)) %>%
+  relocate(prefix, .after = breed)
+
+rownames(ind_metadata) <- ind_metadata$id
+
+# Save cleaned metadata
+saveRDS(ind_metadata, here("data/03_cleaned_r_data", "ind_metadata.RDS"))
+```
+
+Then we want to extract all of the genetic data using an AnnotationHub instance.
+The goal of the following cell is to get all of the genes from chromosome 18 of the pig genome.
+
+```{r}
+
+
+# Load the AnnotationHub and query the EnsDb for Sus scrofa release 101
+annotation_hub <- AnnotationHub()
+
+# Query for Sus scrofa EnsDb v101
+sus_scrofa_ensdb_query <- query(annotation_hub, c("Sus scrofa", "EnsDb", "101"))
+sus_scrofa_ensdb <- sus_scrofa_ensdb_query[[1]]
+
+# Save the EnsDb object for future use
+saveRDS(sus_scrofa_ensdb, here("data/03_cleaned_r_data", "Sus_Scrofa_Db.RDS"))
+
+# Extract gene annotations as a data frame
+gene_metadata <- as.data.frame(genes(sus_scrofa_ensdb))
+
+# Select relevant annotation columns
+gene_metadata <- gene_metadata[, c("seqnames", "start", "end", "width", "strand", "gene_id", "gene_biotype", "description")]
+
+# Identify gene IDs located on chromosome 18
+chr18_gene_ids <- gene_metadata$gene_id[gene_metadata$seqnames == 18]
+
+# Get chromosome 18 genes that are also expressed (present in expression matrix)
+chr18_expressed_genes <- intersect(chr18_gene_ids, rownames(full_gene_expression))
+
+# Subset expression and annotation data for these genes
+chr18_gene_expression <- full_gene_expression[chr18_expressed_genes, ]
+chr18_gene_metadata <- gene_metadata[match(chr18_expressed_genes, gene_metadata$gene_id), ]
+
+# Save filtered and full annotation/expression data
+saveRDS(gene_metadata, here("data/03_cleaned_r_data", "full_gene_metadata.RDS"))
+saveRDS(chr18_gene_metadata, here("data/03_cleaned_r_data", "c_18_gene_metadata.RDS"))
+saveRDS(full_gene_expression, here("data/03_cleaned_r_data", "full_gene_expression.RDS"))
+saveRDS(chr18_gene_expression, here("data/03_cleaned_r_data", "c_18_gene_expression.RDS"))
+
+# Clean up workspace
+rm(
+  annotation_hub,
+  sus_scrofa_ensdb_query,
+  sus_scrofa_ensdb,
+  gene_metadata,
+  chr18_gene_ids,
+  chr18_expressed_genes,
+  chr18_gene_metadata,
+  chr18_gene_expression)
+
+```

@@ -1,0 +1,233 @@
+---
+title: "Data_Exploration"
+author: "Vincent_Spinelli"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## PCA
+
+### Libraries
+
+```{r libraries importation, echo=FALSE, message=FALSE, warning=FALSE}
+
+library(here)
+library(ggplot2)
+library(cowplot)
+library(FactoMineR)
+library(factoextra)
+library(RColorBrewer)
+```
+
+### Data
+
+```{r data_import}
+
+# Clean environment
+rm(list = ls())
+
+# Load expression data (Chr 18)
+expr_chr18 <- readRDS(here("data/03_cleaned_r_data", "c_18_gene_expression.RDS"))
+
+# Load metadata and genotype subset
+metadata <- readRDS(here("data/03_cleaned_r_data", "ind_metadata.RDS"))
+
+#geno_raw <- readRDS(here("data/03_cleaned_r_data", "raw_full_binary_genotype.RDS"))
+geno_raw <- readRDS(here("data/03_cleaned_r_data", "sample_genotype.RDS"))
+
+# Define colors for breed and sex
+col_breeds <- brewer.pal(3, "Set2")
+col_sex <- brewer.pal(3, "Set2")
+
+```
+
+## EDA and PCA
+
+## Sex disparity between breeds
+
+```{r sex_disparity}
+
+# Sanity check
+# sum(ind_metadata[ind_metadata$breed == 'LW' & ind_metadata$sex == "Female",]) # no females!
+
+# Barplot: sex distribution per breed
+ggplot(metadata, aes(x = breed, fill = sex)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Cross barplot of breed and sex", x = "Breed", y = "Count") +
+  scale_fill_manual(values = col_sex) +
+  theme_bw()
+
+```
+
+
+### PCA
+
+```{r PCA on all breeds expr}
+
+# PCA on all individuals using expression data
+pca_expr_all <- PCA(t(expr_chr18), graph = FALSE)
+
+# Scree plot
+barplot(pca_expr_all$eig[1:10, 2], names.arg = 1:10,
+        main = "Variance Explained",
+        xlab = "Principal Components", ylab = "Percentage",
+        col = "steelblue")
+
+# PCA plot colored by breed
+fviz_pca_ind(pca_expr_all, col.ind = metadata$breed, geom = "point") +
+  xlim(-20, 40) + ylim(-15, 25)
+
+```
+
+```{r PCA on all breeds genotype}
+
+# Ensure individuals are rows and SNPs are columns
+geno_t <- t(geno_raw)  # Assuming already transposed: rows = individuals, cols = SNPs
+
+# Align metadata with genotype matrix
+metadata_matched <- metadata[match(rownames(geno_t), metadata$id), ]
+
+# Check alignment
+stopifnot(all(rownames(geno_t) == metadata_matched$id))
+
+# Run PCA
+pca_geno_all <- PCA(geno_t, graph = FALSE)
+
+# Scree plot
+barplot(pca_geno_all$eig[1:10, 2], names.arg = 1:10,
+        main = "Variance Explained - Genotype PCA",
+        xlab = "Principal Components", ylab = "Percentage",
+        col = "steelblue")
+
+# PCA colored by breed
+fviz_pca_ind(pca_geno_all, col.ind = metadata_matched$breed, geom = "point") +
+  ggtitle("Genotype PCA - Colored by Breed") 
+
+```
+
+```{r check for sex effect}
+
+# Remove Large White individuals (no female)
+ids_no_LW <- metadata$id[metadata$breed != "LargeWhite"]
+expr_no_LW <- t(expr_chr18[, ids_no_LW])
+meta_no_LW <- metadata[metadata$id %in% ids_no_LW, ]
+
+# PCA without Large White
+pca_expr_no_LW <- PCA(expr_no_LW, graph = FALSE)
+
+# Plot by breed
+fviz_pca_ind(pca_expr_no_LW, col.ind = meta_no_LW$breed, geom = "point") +
+  scale_color_manual(values = col_breeds[1:2])
+
+# Plot by sex
+fviz_pca_ind(pca_expr_no_LW, col.ind = meta_no_LW$sex, geom = "point") +
+  scale_color_manual(values = col_sex[1:2]) +
+  labs(colour = "Sex") +
+  ggtitle("PCA - No Large White")
+
+```
+
+```{r ACP with binomial standardisation}
+
+# Transpose: individuals as rows, SNPs as columns
+geno <- t(geno_raw)
+
+# Compute allele frequency and scale by binomial expectation
+p <- colMeans(geno, na.rm = TRUE) / 2
+geno_scaled <- scale(geno, center = 2 * p, scale = sqrt(2 * p * (1 - p)))
+
+# PCA on genotype
+pca_geno_all <- PCA(geno_scaled, graph = FALSE)
+
+# Plot by breed
+fviz_pca_ind(pca_geno_all, col.ind = metadata$breed, geom = "point") +
+  scale_color_manual(values = col_breeds) +
+  labs(colour = "Breed") +
+  ggtitle("Genotype PCA - Breed")
+
+```
+
+
+```{r ACP without Duroc with binomial standardisation}
+
+# Remove Duroc individuals
+meta_no_Duroc <- metadata[metadata$breed != "Duroc",]
+ids_no_Duroc <- meta_no_Duroc$id
+geno_no_Duroc <- geno[ids_no_Duroc, ]
+
+# Remove monomorphic genes 
+geno_no_Duroc<- geno_no_Duroc[, apply(geno_no_Duroc, 2, var) > 0]
+
+# Compute allele frequency and scale by binomial scaling
+p <- colMeans(geno_no_Duroc, na.rm = TRUE) / 2
+geno_no_Duroc_scaled <- scale(geno_no_Duroc, center = p, scale = sqrt(2 * p * (1 - p)))
+
+# PCA on genotype
+pca_geno_no_Duroc_scaled <- PCA(geno_no_Duroc_scaled, scale.unit = FALSE, graph = FALSE)
+
+# Plot by breed
+fviz_pca_ind(pca_geno_no_Duroc_scaled, col.ind = meta_no_Duroc$breed, geom = "point") +
+  scale_color_manual(values = col_breeds) +
+  labs(colour = "Breed") +
+  ggtitle("Genotype PCA - Breed")# Plot by sex
+
+saveRDS(pca_geno_no_Duroc_scaled, here("data/03_cleaned_r_data", "geno_PCA_no_DU.RDS"))
+
+
+```
+
+```{r LW ACP}
+
+# Filter LargeWhite individuals
+meta_LW <- subset(metadata, breed == "LargeWhite")
+geno_LW <- geno[meta_LW$id, ]
+
+# Remove monomorphic SNPs
+geno_LW <- geno_LW[, apply(geno_LW, 2, var, na.rm = TRUE) > 0]
+
+# Binomial scaling
+p <- colMeans(geno_LW, na.rm = TRUE) / 2
+geno_LW_scaled <- scale(geno_LW, center = p, scale = sqrt(2 * p * (1 - p)))
+geno_LW_scaled <- as.data.frame(geno_LW_scaled)
+rownames(geno_LW_scaled) <- meta_LW$id  # Ensure individual names are preserved
+
+# PCA
+pca_geno_LW_scaled <- FactoMineR::PCA(geno_LW_scaled, scale.unit = FALSE, graph = FALSE)
+
+# Plot by breed
+fviz_pca_ind(pca_geno_LW_scaled, geom = "point") +
+  ggtitle("Genotype PCA - Large White")
+
+saveRDS(pca_geno_LW_scaled, here("data/03_cleaned_r_data", "geno_PCA_LW.RDS"))
+
+```
+```{r LW ACP}
+
+# Filter LargeWhite individuals
+meta_LD <- subset(metadata, breed == "Landrace")
+geno_LD <- geno[meta_LD$id, ]
+
+# Remove monomorphic SNPs
+geno_LD <- geno_LD[, apply(geno_LD, 2, var, na.rm = TRUE) > 0]
+
+# Binomial scaling
+p <- colMeans(geno_LD, na.rm = TRUE) / 2
+geno_LD_scaled <- scale(geno_LD, center = p, scale = sqrt(2 * p * (1 - p)))
+geno_LD_scaled <- as.data.frame(geno_LD_scaled)
+rownames(geno_LD_scaled) <- meta_LD$id  # Ensure individual names are preserved
+
+# PCA
+pca_geno_LD_scaled <- FactoMineR::PCA(geno_LD_scaled, scale.unit = FALSE, graph = FALSE)
+
+# Plot by breed
+fviz_pca_ind(pca_geno_LD_scaled, geom = "point") +
+  ggtitle("Genotype PCA - Landrace")
+
+saveRDS(pca_geno_LD_scaled, here("data/03_cleaned_r_data", "geno_PCA_LD.RDS"))
+
+saveRDS(rbind(pca_geno_LW_scaled$ind$coord,pca_geno_LD_scaled$ind$coord), here("data/03_cleaned_r_data", "bind_intra_PCAs.RDS"))
+
+```
+
+
+

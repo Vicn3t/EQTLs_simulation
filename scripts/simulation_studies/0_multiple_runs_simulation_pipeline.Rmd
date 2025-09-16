@@ -1,0 +1,600 @@
+---
+title: "multiple_runs_simulation_pipeline"
+author: "Vincent_Spinelli"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+
+
+```{r libraries, message=FALSE, warning=FALSE}
+
+# Path management and data visualization
+library(here)
+library(tidyverse)
+library(tibble)
+
+# GWAS packages
+library(MatrixEQTL)
+
+# Data visualization
+library(ggplot2)    
+library(hrbrthemes)
+library(patchwork)
+library(viridis)
+```
+
+
+```{r simulation variables configuration}
+
+# Clear environment
+rm(list = ls())
+
+# Create a folder to save simulation objects
+if (!dir.exists(here("data", "04_simulation_r_data"))){
+  dir.create(here("data", "04_simulation_r_data"), recursive = TRUE)}
+
+# Empty the directory before doing a new simulation
+unlink(list.files(here("data", "04_simulation_r_data"), full.names = TRUE), recursive = TRUE)
+
+# Set the seed for reproducibility 
+set.seed(123)
+
+# Source the simulation functions
+source(here("scripts/simulation_studies","1_sim_functions.R"))
+
+breeds_prefix = c("LD", "LW")
+
+```
+
+
+```{r data loading and preparation}
+
+  # breed_to_ignore = "Duroc"
+  # breeds_prefix = c("LD", "LW")
+  # n_variants_to_sample = 5000
+  # n_genes_to_sample = 300
+  # n_qtls_per_gene = 2
+  # qtls_rnorm_mean_effect = 1
+  # qtls_rnorm_var_effect = 0.1
+  # genes_heritability = 0.8
+  # variants_gene_max_distance = 1e6
+  # breed_effects_proportions = c(same_effect = 1/3, different_effect = 1/3, opposite_effect = 1/3)
+  # add_no_cov_model = FALSE
+  # Matrix_eQTL_verbose = FALSE
+
+do_multiple_simulation <- function(
+  breed_to_ignore = "Duroc",
+  breeds_prefix = c("LD", "LW"),
+  n_variants_to_sample = 5000,
+  n_genes_to_sample = 300,
+  n_qtls_per_gene,
+  qtls_rnorm_mean_effect = 1,
+  qtls_rnorm_var_effect = 0.1,
+  genes_heritability = 0.8,
+  variants_gene_max_distance = 1e6,
+  breed_effects_proportions = c(same_effect = 1/3, different_effect = 1/3, opposite_effect = 1/3),
+  n_simulation,
+  Matrix_eQTL_verbose = FALSE,
+  add_no_cov_model) {
+  
+  # Lists to store results from each simulation
+  all_models_performances <- list()
+  all_tp_fp_fn_results <- list()
+  
+  # Load individual metadata and remove the breed to ignore
+  ind_metadata <- readRDS(here("data/03_cleaned_r_data", "ind_metadata.RDS")) %>%
+    dplyr::filter(breed != breed_to_ignore)
+
+  # Load full genotype matrix and filter individuals accordingly
+  full_genotypes <- readRDS(here("data/03_cleaned_r_data", 
+                                 "full_genotype.RDS"))[, ind_metadata$id]
+
+  # Compute MAFs and assign variant categories
+  full_variants_metadata <- compute_variants_maf(
+    genotypes = full_genotypes,
+    n_variants_to_sample = n_variants_to_sample,
+    breeds_prefix = breeds_prefix
+  )
+
+  # Subset genotype matrix to sampled variants
+  full_genotypes <- full_genotypes[rownames(full_variants_metadata), ]
+
+  # Load gene metadata (chromosome 18)
+  genes_metadata <- readRDS(here("data/03_cleaned_r_data", "c_18_gene_metadata.RDS"))
+
+  for (i in seq_len(n_simulation)) {
+    
+    print(paste("Simulation n°", i))
+
+    # Sample variants and reorder
+    variants_metadata <- full_variants_metadata %>%
+      slice_sample(n = n_variants_to_sample) %>%
+      arrange(variant_order)
+
+    # Subset genotype matrix to sampled variants
+    genotypes <- full_genotypes[variants_metadata$variant_id, , drop = FALSE]
+
+    # Sample genes
+    genes_sample <- sort(sample(seq_len(nrow(genes_metadata)), n_genes_to_sample))
+    genes_metadata <- genes_metadata[genes_sample, , drop = FALSE]
+
+    # Split genotypes by breed
+    breeds_genotypes <- setNames(
+      lapply(breeds_prefix, function(breed) {
+        as.matrix(genotypes[, str_starts(colnames(genotypes), breed), drop = FALSE])
+      }),
+      breeds_prefix
+    )
+
+    # Associate QTLs to genes based on proximity
+    gene_qtl_associations_table <- associate_genes_with_qtls(
+      genes_metadata = genes_metadata,
+      variants_metadata = variants_metadata,
+      variants_gene_max_distance = variants_gene_max_distance,
+      n_qtls_per_gene = n_qtls_per_gene
+    )
+
+    # Simulate QTL effect sizes
+    qtls_beta_table <- simulate_qtl_effects(
+      gene_qtl_associations_table = gene_qtl_associations_table,
+      breeds_prefix = breeds_prefix,
+      n_qtls_per_gene = n_qtls_per_gene,
+      breed_effects_proportions = breed_effects_proportions,
+      mean_effect = qtls_rnorm_mean_effect,
+      var_effect = qtls_rnorm_var_effect
+    )
+
+    # Simulate gene expression
+    gene_expression_lists <- simulate_gene_expression(
+      qtls_beta_table = qtls_beta_table,
+      genotypes = genotypes,
+      breeds_genotypes = breeds_genotypes,
+      breeds_prefix = breeds_prefix,
+      variants_metadata = variants_metadata,
+      heritability = genes_heritability
+    )
+
+    # Get breed-specific expression dataframe
+    breeds_gene_expression <- get_breeds_gene_expression_df(
+      gene_expression_lists = gene_expression_lists
+    )
+
+    # Load covariates
+    pca_covariates <- get_pca_covariates(
+      pca_rds_path = here("data", "03_cleaned_r_data", "geno_PCA_no_DU.RDS"),
+      individual_ids = ind_metadata$id
+    )
+
+    if (add_no_cov_model){
+    covariates_list <- list(
+      pca_cov = pca_covariates,
+      no_cov = SlicedData$new())
+    }else{covariates_list <- list(pca_cov = pca_covariates)}
+
+    
+    # Run inter-breed eQTL analysis
+    run_eqtl_model(
+      genotypes_matrix = genotypes,
+      expression_df = breeds_gene_expression,
+      covariates_list = covariates_list,
+      output_prefix = "global",
+      output_dir = here("data", "05_sim_models_results", "Matrix_eQTL"),
+      Matrix_eQTL_verbose = Matrix_eQTL_verbose
+    )
+
+    # Run intra-breed eQTL models
+    for (breed in breeds_prefix) {
+      run_intra_breed_eqtl(
+        breed = breed,
+        genotypes = genotypes,
+        expression_data = breeds_gene_expression,
+        metadata = ind_metadata,
+        add_no_cov_model = add_no_cov_model,
+        Matrix_eQTL_verbose = Matrix_eQTL_verbose
+      )
+    }
+
+    # Prepare data for evaluation
+    models_results_path <- here("data/05_sim_models_results")
+
+    variants_df <- variants_metadata %>%
+      select(variant_id, maf, LD_maf, LW_maf, variant_category)
+
+    qtls_df <- qtls_beta_table %>%
+      mutate(
+        is_qtl = TRUE,
+        gene_id = associated_gene,
+        variant_pos = variant_position
+      ) %>%
+      select(gene_id, variant_id, variant_pos, breed_effect, sim_beta, LD_sim_beta, LW_sim_beta, is_qtl)
+
+    # assign each model call to its category (True Positive, False Positive, False Negative)
+    models_tp_fp_fn_results <- compute_models_tp_fp_fn(
+      models_results_path = models_results_path,
+      variants_df = variants_df,
+      qtls_df = qtls_df,
+      breeds_prefix = breeds_prefix)
+    
+    # Evaluate the model 
+    genes_models_performances <- evaluate_models_performances(
+      models_tp_fp_fn_results, qtls_df, variants_df, breeds_prefix)
+    
+    models_performances <- summarize_model_performances(genes_models_performances)
+    
+    models_performances$simulation_id <- i
+
+    # Store both performance and raw FP/TP/FN
+    all_models_performances[[i]] <- models_performances
+    all_tp_fp_fn_results[[i]] <- models_tp_fp_fn_results
+    
+    
+    # Clean output directory for next run
+    unlink(list.files(models_results_path, full.names = TRUE), recursive = TRUE)
+  }
+
+  simulations_models_performances <- bind_rows(all_models_performances)
+
+  models_performances <- aggregate_simulation_metrics(simulations_models_performances)
+  
+  simulations_tp_fp_fn <- bind_rows(all_tp_fp_fn_results, .id = "simulation_id")
+
+  return(list(
+    models_performances = models_performances,
+    simulations_tp_fp_fn = simulations_tp_fp_fn))
+}
+
+```
+
+
+```{r MAF and breeds impact}
+simulations_models_results <- do_multiple_simulation(n_qtls_per_gene = 2, n_simulation = 3, add_no_cov_model = FALSE)
+
+models_performances <- simulations_models_results$models_performances
+
+combined_tp_fp_fn <- simulations_models_results$simulations_tp_fp_fn
+```
+
+
+```{r MAF and breeds impact, eval = FALSE}
+
+#TODO a mettre a jour
+
+# + prendre en compte la répartition de base des mafs
+
+all_models_results =  combined_tp_fp_fn
+plot_tp_and_fn <- function(all_models_results, breeds_prefix) {
+  
+  models_names <- unique(all_models_results$model_name)
+  
+  # Define custom colors for breed_effects
+  effect_colors <- c(
+    "same_effect" = "steelblue",
+    "different_effect" = "firebrick",
+    "opposite_effect" = "orange",
+    "specific_effect" = "darkgreen"
+  )
+  
+  lapply(models_names, function(model_name) {
+    
+    # Identify model type (breed-specific or global)
+    name <- "global"
+    type <- "global"
+    for (prefix in breeds_prefix) {
+      if (grepl(prefix, model_name)) {
+        name <- prefix
+        type <- "breed"
+        break
+      }
+    }
+    
+    # Subset model-specific data
+    model_results <- all_models_results[all_models_results$model_name == model_name,]
+    model_results_qtls <- model_results[model_results$is_qtl == TRUE,]
+    
+    # Split into detected and non-detected QTLs
+    data_list <- list(
+      non_detected_qtls = model_results_qtls[model_results_qtls$is_detected_as_QTL == FALSE,],
+      detected_qtls = model_results_qtls[model_results_qtls$is_detected_as_QTL == TRUE,]
+    )
+    
+    # Initialize plot containers
+    plot_types <- list(p1 = list(), p2 = list(), p3 = list(), p4 = list())
+    
+    for (data_name in names(data_list)) {
+      df <- data_list[[data_name]]
+      effects <- unique(df$breed_effect)
+      
+      # P1: Global MAF density
+      plot_types$p1[[data_name]] <- ggplot(df) +
+        geom_density(aes(x = maf, y = after_stat(density)), fill = "#69b3a2") +
+        annotate("label", x = 0.25, y = 0.25, label = "maf", color = "#69b3a2") +
+        theme_minimal() +
+        xlab("MAF") +
+        ggtitle(paste("Global MAF -", data_name)) +
+        ylim(0, 4)
+      
+      # P2: Mirrored breed MAFs
+      plot_types$p2[[data_name]] <- ggplot(df) +
+        geom_density(aes(x = LD_maf, y = after_stat(density)), fill = "#69b3a2") +
+        annotate("label", x = 0.25, y = 0.25, label = "LD_maf", color = "#69b3a2") +
+        geom_density(aes(x = LW_maf, y = -after_stat(density)), fill = "#404080") +
+        annotate("label", x = 0.25, y = -0.25, label = "LW_maf", color = "#404080") +
+        theme_minimal() +
+        xlab("MAF") +
+        ggtitle(paste("Breeds MAF -", data_name)) +
+        ylim(-2.5, 2.5)
+      
+      # P3: One 2D density plot per effect
+      for (effect in effects) {
+        df_filtered <- df[df$breed_effect == effect, ]
+        key <- paste(data_name, effect, sep = "_")
+        
+        plot_types$p3[[key]] <- ggplot(df_filtered, aes(x = LD_maf, y = LW_maf)) +
+          stat_density2d(geom = "tile", aes(fill = after_stat(density)), contour = FALSE) +
+          geom_point(aes(color = breed_effect), size = 1.5, alpha = 0.6) +
+          scale_fill_gradientn(
+            colours = rev(terrain.colors(10)),
+            limits = c(0, 5),
+            oob = scales::squish
+          ) +
+          scale_color_manual(values = effect_colors[effect]) +
+          theme_minimal() +
+          labs(
+            title = paste("P3 - LD vs LW MAF -", data_name, "-", effect),
+            x = "LD_MAF",
+            y = "LW_MAF"
+          )
+      }
+      
+      # P4: MAF distribution per effect
+      for (effect in effects) {
+        df_filtered <- df[df$breed_effect == effect, ]
+        key <- paste(data_name, effect, sep = "_")
+        
+        plot_types$p4[[key]] <- ggplot(df_filtered, aes(x = maf, fill = breed_effect, color = breed_effect)) +
+          geom_density(alpha = 0.4) +
+          scale_fill_manual(values = effect_colors[effect]) +
+          scale_color_manual(values = effect_colors[effect]) +
+          labs(
+            title = paste("P4 - MAF distribution -", data_name, "-", effect),
+            x = "MAF",
+            y = "Density"
+          ) +
+          theme_minimal()
+      }
+    }
+    
+    # Display plots
+    for (ptype in names(plot_types)) {
+      plots <- plot_types[[ptype]]
+      for (pname in names(plots)) {
+        print(plots[[pname]])
+      }
+    }
+  })
+}
+
+
+
+combined_tp_fp_fn <- simulations_models_results$simulations_tp_fp_fn
+
+plot_tp_and_fn(combined_tp_fp_fn, breeds_prefix = breeds_prefix)
+
+```
+
+
+```{r MAF and breeds impact}
+simulations_models_results <- do_multiple_simulation(n_qtls_per_gene = 2, n_simulation = 3, add_no_cov_model = FALSE)
+
+models_performances <- simulations_models_results$models_performances
+
+combined_tp_fp_fn <- simulations_models_results$simulations_tp_fp_fn
+```
+
+
+```{r compare global model with the two breeds models}
+
+all_models_results <- combined_tp_fp_fn %>%
+  mutate(model = case_when(
+    model_name == "global_pca_cov" ~ "global_model",
+    model_name == "intra_LD_pca_cov" ~ "intra_models",
+    model_name == "intra_LW_pca_cov" ~ "intra_models"
+  ))
+
+all_models_results <- all_models_results %>%
+  mutate(model_name = case_when(
+    model_name == "global_pca_cov" ~ "global_model",
+    model_name == "intra_LD_pca_cov" ~ "LD_model",
+    model_name == "intra_LW_pca_cov" ~ "LW_model"
+  ))
+
+plot_model_results_df <- all_models_results %>%
+  filter(is_qtl == TRUE) %>%
+  filter(!(breed_effect == "specific_effect")) %>%
+  group_by(breed_effect, model) %>%
+  summarise(detection_rate = mean(is_detected_as_QTL), .groups = "drop") 
+  
+
+plot_model_results_df$breed_effect <- factor(plot_model_results_df$breed_effect,
+                                             levels = c("same_effect",
+                                                        "different_effect",
+                                                        "opposite_effect"))
+
+# Heatmap
+plot_model_results <- ggplot(plot_model_results_df, aes(x = breed_effect,
+                                                        y = model,
+                                                        fill = detection_rate)) +
+  geom_tile() +
+  geom_text(aes(label = round(detection_rate, 2))) +
+  scale_fill_gradient(low = "white", high = "steelblue", limits = c(0, 1))+
+  labs(title = paste("True causal variants detection rate"),
+       x = "Breed effect", y = "Variant category") +
+  theme_minimal()
+
+plot_model_results
+
+
+# Specific variants matrices
+specific_effects_df <- all_models_results %>%
+  filter(is_qtl == TRUE) %>%
+  filter(variant_category %in% c("LD_specific", "LW_specific")) %>%
+  group_by(model, variant_category) %>%
+  summarise(detection_rate = mean(is_detected_as_QTL), .groups = "drop")
+
+plot_confusion <- ggplot(specific_effects_df,
+                         aes(x = variant_category, y = model, fill = detection_rate)) +
+  geom_tile() +
+  geom_text(aes(label = round(detection_rate, 2))) +
+  scale_fill_gradient(low = "white", high = "steelblue", limits = c(0, 1))+
+  labs(title = "Detection rate for specific QTLs",
+       x = "Breed-specific effect", y = "Model group") +
+  theme_minimal()
+
+plot_confusion
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+df <- all_models_results
+# Prepare Large White (LW) data
+df_LW <- df %>%
+  filter(!(breed_effect == "specific_effect")) %>%
+  filter(is_qtl == TRUE) %>%
+  filter(is_detected_as_QTL == TRUE) %>%
+  filter(model_name %in% c("global_model", "LW_model")) %>%
+  mutate(
+    sim_beta = LW_sim_beta,
+    breed = "LW") %>%
+    mutate(
+    sim_beta = ifelse(sim_beta < 0, -sim_beta, sim_beta),
+    estimated_beta = ifelse(LW_sim_beta < 0, -estimated_beta, estimated_beta)
+  )
+
+# Prepare Landrace (LD) data
+df_LD <- df %>%
+  filter(model_name %in% c("global_model", "LD_model")) %>%
+  filter(!(breed_effect == "specific_effect")) %>%
+  filter(is_qtl == TRUE) %>%
+  filter(is_detected_as_QTL == TRUE) %>%
+  mutate(
+    sim_beta = LD_sim_beta,
+    breed = "LD")%>%
+    mutate(
+    sim_beta = ifelse(sim_beta < 0, -sim_beta, sim_beta),
+    estimated_beta = ifelse(LD_sim_beta < 0, -estimated_beta, estimated_beta)
+  )
+
+
+# -------------------- PLOT FOR LARGE WHITE --------------------
+ggplot(df_LW, aes(x = sim_beta, y = estimated_beta, color = breed_effect)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~model_name) +
+  labs(
+    title = "Estimated vs Simulated Effect – Large White",
+    x = "Simulated effect (LW)",
+    y = "Estimated effect",
+    color = "Effect type"
+  ) +
+  theme_minimal()
+
+# -------------------- PLOT FOR LANDRACE --------------------
+ggplot(df_LD, aes(x = sim_beta, y = estimated_beta, color = breed_effect)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~model_name) +
+  labs(
+    title = "Estimated vs Simulated Effect – Landrace",
+    x = "Simulated effect (LD)",
+    y = "Estimated effect",
+    color = "Effect type"
+  ) +
+  theme_minimal()
+
+```
+
+
+```{r PCA covariables impact, eval = FALSE}
+
+n_simulations = 3
+all_models_results <- do_multiple_simulation(n_simulation = n_simulations, n_qtls_per_gene = 2, add_no_cov_model = TRUE)
+
+
+models_performances <- all_models_results$models_performances
+
+
+
+plot_delta_metric_ic95 <- function(models_performances, metric, n_simulations = n_simulations, 
+                                   breeds_prefix = c("LD", "LW"),name) {
+
+    data <- models_performances %>%
+    group_by(model_name) %>%
+    mutate(
+      model_type = case_when(
+        str_detect(model_name, "global") ~ "global",
+        str_detect(model_name, "intra") ~ "intra",
+        TRUE ~ "unknown"
+      ),
+      covariates = case_when(
+        str_detect(model_name, "no_cov") ~ "no_cov",
+        str_detect(model_name, "pca_cov") ~ "pca_cov",
+        TRUE ~ "unknown"
+      ),
+      breed = case_when(
+        str_detect(model_name, breeds_prefix[1]) ~ breeds_prefix[1],
+        str_detect(model_name, breeds_prefix[2]) ~ breeds_prefix[2],
+        str_detect(model_name, "global") ~ "global",
+        TRUE ~ NA_character_
+      )
+    )%>% ungroup()
+
+  metric_summary <- data %>%
+    select(model_name,model_type, breed, covariates,
+           mean = !!sym(paste0(metric, "_mean")),
+           sd = !!sym(paste0(metric, "_sd")))
+    
+  delta_df <- metric_summary %>%
+    select(model_type, breed, covariates, mean, sd) %>%
+    pivot_wider(names_from = covariates, values_from = c(mean, sd)) %>%
+    mutate(
+      delta_mean = mean_pca_cov - mean_no_cov,
+      delta_sd = sqrt(sd_no_cov^2 + sd_pca_cov^2)
+      )%>%
+  mutate(
+    delta_pct = 100 * delta_mean / mean_no_cov,
+    delta_pct_low = delta_pct - (100 * delta_sd / mean_no_cov),
+    delta_pct_high = delta_pct + (100 * delta_sd / mean_no_cov)
+  )
+
+ggplot(delta_df, aes(x = breed, y = delta_pct, fill = model_type)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.6), width = 0.5) +
+  geom_errorbar(
+    aes(ymin = delta_pct_low, ymax = delta_pct_high),
+    width = 0.2,
+    position = position_dodge(width = 0.6)
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(breaks = seq(-100, 100, by = 20)) + 
+  coord_cartesian(ylim = c(-100, 100)) +
+  labs(
+    title = paste0("Variation (%) des ", metric, " avec l'ajout des covariables PCA"),
+    x = "Race",
+    y = paste0("Δ ", metric, " (%) (pca_cov vs no_cov)"),
+    fill = "Type de modèle"
+  ) +
+  theme_minimal()
+
+}
+
+plot_delta_metric_ic95(models_performances, metric = "FP", n_simulations = n_simulations, name = "Faux Positifs")
+
+
+plot_delta_metric_ic95(models_performances, metric = "TP", n_simulations = n_simulations, name = "Vrais Positifs")
+
+```
+
